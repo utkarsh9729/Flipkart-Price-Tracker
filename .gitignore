@@ -1,0 +1,7 @@
+node_modules/
+browser-data/
+.playwright-mcp/
+scratch/
+*.log
+shards/
+shard-*.json

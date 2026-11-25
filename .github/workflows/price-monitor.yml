@@ -1,0 +1,112 @@
+name: Flipkart Price Error Monitor (Cron)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test_alert:
+        description: "Send a test Telegram alert even if no price error occurs"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: flipkart-price-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor-shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+
+    steps:
+      - name: Shallow checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run Fast Multithreaded Flipkart Price Monitor (Shard ${{ matrix.shard }}/8)
+        env:
+          WORKERS: "4"
+          CONCURRENCY_PER_WORKER: "8"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MID_DISCOUNT_TELEGRAM_CHAT_ID: ${{ secrets.MID_DISCOUNT_TELEGRAM_CHAT_ID }}
+          HIGH_DISCOUNT_TELEGRAM_CHAT_ID: ${{ secrets.HIGH_DISCOUNT_TELEGRAM_CHAT_ID }}
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.send_test_alert }}" = "true" ] && [ "${{ matrix.shard }}" = "1" ]; then
+            EXTRA_ARGS="--send-test-alert"
+          fi
+          node price-monitor.js --shard ${{ matrix.shard }}/8 --shard-out shard-${{ matrix.shard }}.json $EXTRA_ARGS
+
+      - name: Upload Shard Delta Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  merge-and-save:
+    needs: monitor-shard
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Shallow checkout latest main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download Shard Delta Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+
+      - name: Merge Shards & Push Updated price-data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            node price-monitor.js --merge-shards shards
+            git add price-data.json
+            if git diff --staged --quiet; then
+              echo "No price changes to commit."
+              exit 0
+            fi
+            git commit -m "chore: update Flipkart historical prices and averages"
+            if git push origin main; then
+              echo "Pushed updated price-data.json successfully."
+              exit 0
+            fi
+            echo "Push conflict on attempt $attempt — re-syncing shallow origin/main and re-merging shards..."
+            git reset --hard HEAD~1
+            git fetch --depth=1 origin main
+            git reset --hard origin/main
+          done
+          echo "Failed to push after 3 attempts."
+          exit 1
